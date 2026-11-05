@@ -1,0 +1,20 @@
+# dependencias e artefatos
+/node_modules
+/dist
+/coverage
+/.cache
+*.tsbuildinfo
+
+# ambiente local
+.env
+.env.*
+!.env.example
+
+# Prisma gerado
+/src/generated/prisma
+
+# ferramentas e sistema operacional
+.DS_Store
+*.log
+.idea/
+.vscode/

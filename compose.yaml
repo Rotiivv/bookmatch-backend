@@ -1,0 +1,30 @@
+name: bookmatch
+
+services:
+  mariadb:
+    image: mariadb:11.8.9
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-bookmatch}
+      MARIADB_USER: ${MARIADB_USER:-bookmatch}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:-bookmatch_dev}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:-bookmatch_root_dev}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "healthcheck.sh",
+          "--connect",
+          "--innodb_initialized",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  mariadb_data:
