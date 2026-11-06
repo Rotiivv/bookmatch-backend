@@ -43,3 +43,18 @@ npm test
 npm run test:e2e
 npm run lint
 ```
+
+## Integração contínua e espelhamento
+
+O workflow `.github/workflows/ci.yml` executa lint, build, testes unitários e
+testes e2e em todo pull request e em todo push na `main`.
+
+Quando um push na `main` passa no CI, a `main` é enviada para a branch
+`backend` de `BookMatchTeam/bookmatch`. O envio usa uma deploy key com escrita
+nesse repositório, cuja chave privada fica no secret
+`BOOKMATCH_TEAM_DEPLOY_KEY` deste repositório. Sem o secret, o espelhamento é
+ignorado com um aviso.
+
+A branch `backend` é somente leitura: alterações devem ser feitas neste
+repositório. O envio não usa `--force`, então commits feitos diretamente nela
+interrompem o espelhamento.
