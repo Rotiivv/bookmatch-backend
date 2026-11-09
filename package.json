@@ -12,7 +12,7 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main.js",
-    "lint": "oxlint src/ test/",
+    "lint": "oxlint --deny-warnings src/ test/",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",

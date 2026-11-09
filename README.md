@@ -43,3 +43,8 @@ npm test
 npm run test:e2e
 npm run lint
 ```
+
+## Integração contínua
+
+O workflow `.github/workflows/ci.yml` executa lint, build, testes unitários e
+testes e2e em todo pull request e em todo push na `main`.

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verificar:
+    name: Lint, build e testes
+    runs-on: ubuntu-latest
+    env:
+      # O .env nao e versionado. O prisma7.config.ts exige DATABASE_URL para
+      # carregar, mas o prisma generate nao se conecta ao banco.
+      DATABASE_URL: mysql://ci:ci@localhost:3306/ci
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run prisma:generate
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+      - run: npm run test:e2e
+
