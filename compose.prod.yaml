@@ -1,0 +1,98 @@
+# Ambiente de producao na VPS.
+#
+# Servicos:
+# - caddy:   unica porta aberta para a internet (80/443). Obtem e renova o
+#            certificado HTTPS e repassa as requisicoes para a API.
+# - api:     a aplicacao, montada a partir do Dockerfile.
+# - mariadb: o banco, acessivel apenas pela rede interna do Compose.
+# - migrate: tarefa avulsa que aplica as migrations do Prisma. Nao fica
+#            rodando; e executada pelo deploy/deploy.sh a cada deploy.
+#
+# Os valores vem do arquivo .env ao lado deste arquivo, na VPS
+# (modelo em deploy/env.production.example).
+
+name: bookmatch-prod
+
+services:
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?defina API_DOMAIN no .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      target: runtime
+    image: bookmatch-backend:latest
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      DATABASE_HOST: mariadb
+      DATABASE_PORT: 3306
+      DATABASE_USER: ${MARIADB_USER:?defina MARIADB_USER no .env}
+      DATABASE_PASSWORD: ${MARIADB_PASSWORD:?defina MARIADB_PASSWORD no .env}
+      DATABASE_NAME: ${MARIADB_DATABASE:?defina MARIADB_DATABASE no .env}
+    # Sem "ports": a API so e alcancada pelo Caddy, pela rede interna.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3000/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      mariadb:
+        condition: service_healthy
+
+  mariadb:
+    image: mariadb:11.8.9
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${MARIADB_DATABASE:?defina MARIADB_DATABASE no .env}
+      MARIADB_USER: ${MARIADB_USER:?defina MARIADB_USER no .env}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?defina MARIADB_PASSWORD no .env}
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?defina MARIADB_ROOT_PASSWORD no .env}
+    # Sem "ports": o banco nao fica exposto na internet.
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  migrate:
+    build:
+      context: .
+      target: build
+    image: bookmatch-backend-build:latest
+    environment:
+      DATABASE_URL: mysql://${MARIADB_USER}:${MARIADB_PASSWORD}@mariadb:3306/${MARIADB_DATABASE}
+    command: ["npx", "prisma", "migrate", "deploy"]
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    profiles: ["tools"]
+
+volumes:
+  mariadb_data:
+  caddy_data:
+  caddy_config:

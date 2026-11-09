@@ -1,0 +1,8 @@
+# Proxy reverso da API.
+#
+# Com um dominio em API_DOMAIN, o Caddy obtem e renova sozinho o certificado
+# HTTPS (Let's Encrypt) e redireciona HTTP para HTTPS.
+{$API_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy api:3000
+}
