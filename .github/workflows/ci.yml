@@ -31,3 +31,47 @@ jobs:
       - run: npm test
       - run: npm run test:e2e
 
+      # Garante que o Dockerfile continua montando antes do merge, em vez de
+      # descobrir o problema so no deploy.
+      - name: Montar imagem Docker
+        run: docker build --target runtime -t bookmatch-backend:ci .
+
+  deploy:
+    name: Deploy na VPS
+    needs: verificar
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: producao
+      url: https://api-bookmatch.galpao.tech/health
+    concurrency:
+      group: deploy-producao
+      cancel-in-progress: false
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+    steps:
+      - name: Conferir configuracao
+        id: config
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ] || [ -z "$VPS_SSH_KEY" ]; then
+            echo "::warning::Secrets VPS_HOST, VPS_USER e VPS_SSH_KEY nao configurados; deploy ignorado."
+            echo "pronto=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "pronto=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publicar na VPS
+        if: steps.config.outputs.pronto == 'true'
+        env:
+          # Commit exato que passou no job verificar.
+          SHA: ${{ github.sha }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -t ed25519 "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" \
+            "cd ~/bookmatch-backend && git fetch --quiet origin main && git checkout --quiet --detach $SHA && bash deploy/deploy.sh"

@@ -48,3 +48,12 @@ npm run lint
 
 O workflow `.github/workflows/ci.yml` executa lint, build, testes unitários e
 testes e2e em todo pull request e em todo push na `main`.
+
+Quando um push na `main` passa no CI, o job "Deploy na VPS" publica a nova
+versão em produção.
+
+## Deploy
+
+A API roda numa VPS com Docker Compose (`compose.prod.yaml`): Caddy (HTTPS),
+API e MariaDB. O passo a passo para preparar a VPS e ligar o deploy automático
+está em [`docs/deploy.md`](docs/deploy.md).
