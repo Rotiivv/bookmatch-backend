@@ -1,0 +1,55 @@
+# Laboratorio do Nginx: roda no SEU computador, nao na VPS.
+# A producao continua com o Caddy (compose.prod.yaml); nada aqui mexe nela.
+#
+# Guia completo: labs/nginx/README.md
+name: lab-nginx
+
+services:
+  # A mesma imagem de producao da API. Sem banco: o /health nao usa o MariaDB.
+  api:
+    build:
+      context: ../..
+      target: runtime
+    image: bookmatch-backend:lab
+    environment:
+      PORT: 3000
+    # Sem "ports": a API so e acessivel pelo Nginx, como na VPS.
+
+  nginx:
+    image: nginx:1.28.3-alpine
+    ports:
+      # 8080 e 8443 no seu computador, para nao brigar com outros programas.
+      # Na VPS seriam 80 e 443.
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      # A configuracao em uso. Em cada etapa voce troca o default.conf.
+      - ./conf.d:/etc/nginx/conf.d:ro
+      # Certificados da etapa 3.
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - api
+
+  # Ferramenta da etapa 3: gera um certificado autoassinado em ./certs.
+  # So roda quando chamada: docker compose run --rm certificado
+  certificado:
+    image: alpine/openssl:3.5.9
+    profiles: [ferramentas]
+    volumes:
+      - ./certs:/certs
+    command:
+      - req
+      - -x509
+      - -newkey
+      - rsa:2048
+      - -nodes
+      - -days
+      - "30"
+      - -subj
+      - /CN=localhost
+      - -addext
+      - subjectAltName=DNS:localhost
+      - -keyout
+      - /certs/localhost.key
+      - -out
+      - /certs/localhost.crt

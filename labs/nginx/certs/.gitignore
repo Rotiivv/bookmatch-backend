@@ -1,0 +1,3 @@
+# Certificados gerados no laboratorio: nunca vao para o Git.
+*
+!.gitignore
