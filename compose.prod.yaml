@@ -13,9 +13,18 @@
 
 name: bookmatch-prod
 
+# Limita os logs de cada container a 3 arquivos de 10 MB. Sem isso, o Docker
+# guarda os logs sem limite e eles podem encher o disco da VPS.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   caddy:
     image: caddy:2.10.2-alpine
+    logging: *logging
     restart: unless-stopped
     environment:
       API_DOMAIN: ${API_DOMAIN:?defina API_DOMAIN no .env}
@@ -35,6 +44,7 @@ services:
     build:
       context: .
       target: runtime
+    logging: *logging
     image: bookmatch-backend:latest
     restart: unless-stopped
     environment:
@@ -63,6 +73,7 @@ services:
 
   mariadb:
     image: mariadb:11.8.9
+    logging: *logging
     restart: unless-stopped
     environment:
       MARIADB_DATABASE: ${MARIADB_DATABASE:?defina MARIADB_DATABASE no .env}

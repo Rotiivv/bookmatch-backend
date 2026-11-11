@@ -46,11 +46,13 @@ npm run lint
 
 ## Integração contínua
 
-O workflow `.github/workflows/ci.yml` executa lint, build, testes unitários e
-testes e2e em todo pull request e em todo push na `main`.
+O workflow `.github/workflows/ci.yml` executa lint, build, testes unitários,
+testes e2e e um smoke test do pacote de produção (`deploy/smoke-test.sh`) em
+todo pull request e em todo push na `main`.
 
-Quando um push na `main` passa no CI, o job "Deploy na VPS" publica a nova
-versão em produção.
+Quando o CI passa na `main`, o workflow `.github/workflows/cd.yml` publica a
+nova versão em produção. Ele também pode ser disparado manualmente, para
+republicar ou voltar para um commit anterior da `main`.
 
 ## Deploy
 

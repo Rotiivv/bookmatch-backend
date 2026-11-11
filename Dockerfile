@@ -9,10 +9,20 @@
 FROM node:24-slim AS build
 WORKDIR /app
 
+# A CLI do Prisma (usada pelo servico migrate) precisa da biblioteca OpenSSL,
+# que nao vem na imagem slim.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY package.json package-lock.json ./
 RUN npm ci
 
-COPY . .
+# Apenas o que o build usa. O .dockerignore continua como segunda protecao.
+COPY tsconfig.json tsconfig.build.json nest-cli.json prisma7.config.ts ./
+COPY prisma ./prisma
+COPY src ./src
+
 # O prisma7.config.ts exige DATABASE_URL para carregar, mas o generate nao se
 # conecta ao banco. O valor real e informado em tempo de execucao.
 RUN DATABASE_URL="mysql://build:build@localhost:3306/build" npm run prisma:generate \

@@ -6,11 +6,18 @@ Depois de pronto, todo merge na `main` que passar no CI e publicado sozinho.
 ## Como funciona
 
 ```text
+pull request
+  -> CI (.github/workflows/ci.yml), job "Lint, build e testes":
+       lint, build, testes unitarios e e2e
+       smoke test (deploy/smoke-test.sh): monta as imagens e liga banco,
+       migrations e API como na VPS, chamando o /health
+  -> o merge so e liberado com o CI verde
+
 merge na main
-  -> GitHub Actions, job "Lint, build e testes" (CI)
-  -> job "Deploy na VPS" (CD), apenas se o CI passar:
+  -> CI roda de novo na main
+  -> CD (.github/workflows/cd.yml), apenas se o CI passou:
        entra na VPS por SSH como usuario deploy e executa
-         git fetch + git checkout <commit aprovado>
+         git fetch + confere que o commit pertence a main + git checkout
          bash deploy/deploy.sh
            -> monta as imagens Docker na propria VPS
            -> sobe o MariaDB
@@ -18,220 +25,279 @@ merge na main
            -> sobe a API e o Caddy e espera a API ficar saudavel
 ```
 
+O CD tambem pode ser disparado a mao (veja "Operacao do dia a dia").
+
 Na VPS rodam tres containers, descritos em `compose.prod.yaml`:
 
-| Servico   | Funcao                                                        | Exposto na internet |
-| --------- | ------------------------------------------------------------- | ------------------- |
-| `caddy`   | Recebe as requisicoes, cuida do HTTPS e repassa para a API     | Sim (80 e 443)      |
-| `api`     | A aplicacao NestJS                                             | Nao                 |
-| `mariadb` | O banco de dados, com os dados num volume persistente          | Nao                 |
+| Servico   | Funcao                                                    | Exposto na internet |
+| --------- | --------------------------------------------------------- | ------------------- |
+| `caddy`   | Recebe as requisicoes, cuida do HTTPS e repassa para a API | Sim (80 e 443)      |
+| `api`     | A aplicacao NestJS                                         | Nao                 |
+| `mariadb` | O banco de dados, com os dados num volume persistente      | Nao                 |
+
+O servico `migrate` nao fica rodando: o `deploy.sh` o executa uma vez por
+deploy para aplicar as migrations.
 
 Valores usados neste guia:
 
-| Item                  | Valor                        |
-| --------------------- | ---------------------------- |
-| IP da VPS             | `187.41.123.210`             |
-| Dominio da API        | `api-bookmatch.galpao.tech`  |
-| Usuario de deploy     | `deploy`                     |
-| Pasta do projeto      | `/home/deploy/bookmatch-backend` |
+| Item              | Valor                            |
+| ----------------- | -------------------------------- |
+| IP da VPS         | `187.41.123.210`                 |
+| Dominio da API    | `api-bookmatch.galpao.tech`      |
+| Sistema           | Ubuntu 26.04 LTS                 |
+| Usuario de deploy | `deploy`                         |
+| Pasta do projeto  | `/home/deploy/bookmatch-backend` |
+
+Os comandos podem ser executados pelo terminal do navegador do hPanel ou por
+SSH. Quando um passo trocar de usuario com `su - deploy`, rode o `su` sozinho
+e so cole os comandos seguintes depois que o prompt mudar para
+`deploy@...$`: linhas coladas junto com o `su` se perdem na troca.
 
 ---
 
 ## Fase 0: DNS
 
-Um registro `A` faz `api-bookmatch.galpao.tech` apontar para o IP da VPS.
-No hPanel: Dominios -> galpao.tech -> DNS / Nameservers -> Gerenciar registros DNS.
+Um registro `A` faz `api-bookmatch.galpao.tech` apontar para o IP da VPS. No
+hPanel: Dominios -> galpao.tech -> DNS / Nameservers -> Gerenciar registros
+DNS (nao use a aba "Child nameservers", que serve para outra coisa).
 
 | Tipo | Nome            | Valor            | TTL   |
 | ---- | --------------- | ---------------- | ----- |
 | A    | `api-bookmatch` | `187.41.123.210` | 14400 |
 
-Confira no seu computador:
+Confira no seu computador. A primeira consulta vai direto ao servidor de DNS
+da Hostinger; a segunda, a um servidor publico, que pode demorar mais para
+receber a mudanca:
 
 ```bash
+nslookup api-bookmatch.galpao.tech apollo.dns-parking.com
 nslookup api-bookmatch.galpao.tech 8.8.8.8
 ```
 
-A resposta deve mostrar `187.41.123.210`. O Caddy so consegue o certificado
-HTTPS depois que isso estiver valendo.
+As duas devem mostrar `187.41.123.210`. O Caddy so consegue o certificado
+HTTPS depois que o DNS estiver valendo para o mundo.
 
 ---
 
-## Fase 1: acesso e seguranca
+## Fase 1: sistema, usuario e firewall
 
-### 1.1 Entrar como root e atualizar o sistema
+Como `root`.
+
+### 1.1 Atualizar o sistema
 
 ```bash
-ssh root@187.41.123.210
-cat /etc/os-release          # os comandos deste guia assumem Ubuntu
+cat /etc/os-release            # confirme que e Ubuntu
 apt update && apt upgrade -y
+ls /var/run/reboot-required 2>/dev/null && echo "PRECISA REINICIAR" || echo "nao precisa reiniciar"
 ```
 
-`apt update` baixa a lista de versoes novas; `apt upgrade -y` instala as
-correcoes de seguranca antes de expor a maquina.
+Se precisar reiniciar (atualizacao de kernel), rode `reboot`, espere um ou
+dois minutos, entre de novo e confira a versao com `uname -r`.
 
 ### 1.2 Criar o usuario `deploy`
 
-O `root` pode tudo, inclusive estragar o sistema num erro de digitacao. O dia a
-dia (e o deploy automatico) usa um usuario comum, que pede `sudo` quando precisa.
+O dia a dia e o deploy automatico usam um usuario comum, que pede `sudo`
+quando precisa, em vez do `root`.
 
 ```bash
-adduser deploy
+adduser deploy                 # defina uma senha forte; os demais campos podem ficar vazios
 usermod -aG sudo deploy
+id deploy                      # deve listar o grupo sudo
 ```
 
-### 1.3 Entrar com chave SSH
+### 1.3 Firewall
 
-Senhas podem ser adivinhadas por robos que testam servidores o tempo todo.
-Com chave, so entra quem tem o arquivo da chave privada. A publica vai para a
-VPS; a privada fica no seu computador.
-
-No seu computador, se ainda nao tiver uma chave:
+Bloqueia tudo que chega, exceto SSH (22), HTTP (80, usado pelo Caddy para o
+certificado e o redirecionamento) e HTTPS (443). Libere a porta 22 antes de
+ligar o firewall.
 
 ```bash
-ssh-keygen -t ed25519 -C "meu-computador"
-```
-
-Envie a chave publica para o usuario `deploy`:
-
-```bash
-# macOS / Linux
-ssh-copy-id deploy@187.41.123.210
-
-# Windows (PowerShell)
-type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh deploy@187.41.123.210 "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-```
-
-Teste num terminal novo: `ssh deploy@187.41.123.210` deve entrar sem pedir a
-senha do usuario.
-
-### 1.4 Firewall
-
-Abre apenas o necessario: 22 (SSH), 80 (HTTP, usado pelo Caddy para obter o
-certificado e redirecionar) e 443 (HTTPS).
-
-```bash
-sudo ufw allow OpenSSH       # primeiro o SSH, para nao se trancar para fora
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
-sudo ufw status
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw enable                     # responda y
+ufw status verbose
 ```
 
 Portas publicadas pelo Docker passam por fora do `ufw`. Por isso, no
-`compose.prod.yaml`, so o Caddy publica portas; a API e o banco nao. Se o
-firewall do painel da Hostinger estiver ativo, libere as mesmas portas la.
+`compose.prod.yaml`, so o Caddy publica portas. Se o firewall do painel da
+Hostinger estiver ativo, libere as mesmas portas la.
 
-### 1.5 Desligar login por senha e login como root
+### 1.4 Fechar o SSH (faca por ultimo)
 
-Faca apenas depois de confirmar que o passo 1.3 funciona.
+Desliga o login por senha e o login do `root` pelo SSH; so entra quem tiver
+uma chave autorizada. Faca depois que o deploy estiver funcionando e na ordem
+abaixo, para nao perder o acesso.
 
-```bash
-sudo tee /etc/ssh/sshd_config.d/99-seguranca.conf > /dev/null <<'EOF'
-PasswordAuthentication no
-PermitRootLogin no
-EOF
-sudo systemctl reload ssh
-```
+1. No seu computador, crie uma chave pessoal (se ainda nao tiver uma) e
+   autorize-a no usuario `deploy`:
 
-Sem fechar o terminal atual, teste num novo: `ssh deploy@...` entra e
-`ssh root@...` e recusado. Se algo der errado, o hPanel tem um console de
-emergencia no navegador.
+   ```bash
+   ssh-keygen -t ed25519 -C "meu-computador"
+
+   # macOS / Linux
+   ssh-copy-id deploy@187.41.123.210
+
+   # Windows (PowerShell)
+   type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh deploy@187.41.123.210 "cat >> ~/.ssh/authorized_keys"
+   ```
+
+2. Teste num terminal novo: `ssh deploy@187.41.123.210` deve entrar sem pedir
+   a senha do usuario.
+
+3. Na VPS, como `root`, feche o SSH:
+
+   ```bash
+   tee /etc/ssh/sshd_config.d/99-seguranca.conf > /dev/null <<'EOF'
+   PasswordAuthentication no
+   PermitRootLogin no
+   EOF
+   systemctl reload ssh
+   ```
+
+4. Sem fechar a sessao atual, teste num terminal novo: `ssh deploy@...` entra
+   e `ssh root@...` e recusado. Se algo der errado, o hPanel tem um console de
+   emergencia.
+
+O terminal do navegador do hPanel pode deixar de funcionar como `root` depois
+desse passo, dependendo de como a Hostinger o implementa. Garanta o passo 2
+antes.
 
 ---
 
 ## Fase 2: Docker
 
-O Docker roda os containers; o plugin Compose sobe os tres servicos juntos a
-partir do `compose.prod.yaml`. Instalacao pelo repositorio oficial do Docker:
+Algumas imagens da Hostinger ja trazem o Docker. Confira antes de instalar:
 
 ```bash
-sudo apt install -y ca-certificates curl git
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
-  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+docker --version
+docker compose version
+systemctl is-active docker
+docker ps -a                                  # containers existentes
+ss -tlnp | grep -E ':(80|443)\s'              # nada deve aparecer: portas livres
 ```
 
-Permita que o usuario `deploy` use o Docker sem `sudo` (necessario para o
-deploy automatico). Quem esta no grupo `docker` tem poder equivalente ao root,
-entao so adicione usuarios de confianca.
+Se o Docker nao estiver instalado, use o repositorio oficial. Antes, confira se
+ele ja publica pacotes para a sua versao do Ubuntu (deve responder `200`):
 
 ```bash
-sudo usermod -aG docker deploy
-exit                                  # saia e entre de novo para o grupo valer
-ssh deploy@187.41.123.210
-docker run --rm hello-world           # deve imprimir "Hello from Docker!"
-docker compose version
+curl -fsSI "https://download.docker.com/linux/ubuntu/dists/$(. /etc/os-release && echo "$VERSION_CODENAME")/Release" | head -1
+```
+
+```bash
+apt install -y ca-certificates curl git
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+
+tee /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+
+apt update
+apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Mesmo com o Docker ja instalado, cadastrar o repositorio garante as
+atualizacoes de seguranca.
+
+Permita que o `deploy` use o Docker sem `sudo` (necessario para o deploy
+automatico). Quem esta no grupo `docker` tem poder equivalente ao root, entao
+so adicione usuarios de confianca.
+
+```bash
+usermod -aG docker deploy
+su - deploy                    # rode sozinho
+```
+
+Ja como `deploy`:
+
+```bash
+groups                         # deve listar docker
+docker run --rm hello-world    # deve imprimir "Hello from Docker!"
+exit
 ```
 
 ---
 
 ## Fase 3: codigo e configuracao de producao
 
-O repositorio e publico, entao a VPS clona sem precisar de chave.
+Como `deploy` (`su - deploy`, sozinho). O repositorio e publico, entao a VPS
+clona sem precisar de chave.
 
 ```bash
 git clone https://github.com/Rotiivv/bookmatch-backend.git ~/bookmatch-backend
 cd ~/bookmatch-backend
-cp deploy/env.production.example .env
-chmod 600 .env                        # so o usuario deploy le o arquivo
 ```
 
-Gere duas senhas e coloque-as no `.env` (`MARIADB_PASSWORD` e
-`MARIADB_ROOT_PASSWORD`):
+Crie o `.env` de producao com senhas geradas automaticamente:
 
 ```bash
-openssl rand -hex 24
-openssl rand -hex 24
-nano .env                             # Ctrl+O salva, Ctrl+X sai
+cp deploy/env.production.example .env
+chmod 600 .env
+sed -i "s/^MARIADB_PASSWORD=.*/MARIADB_PASSWORD=$(openssl rand -hex 24)/" .env
+sed -i "s/^MARIADB_ROOT_PASSWORD=.*/MARIADB_ROOT_PASSWORD=$(openssl rand -hex 24)/" .env
+git check-ignore .env && echo "ok: .env ignorado pelo git"
+grep -v '^#' .env | grep -v '^$' | sed -E 's/(PASSWORD=).*/\1********/'
 ```
 
-Use apenas letras e numeros nas senhas: caracteres como `@` ou `/` quebram a
-URL de conexao do Prisma. O `.env` fica so na VPS e nunca vai para o Git.
+- `chmod 600`: so o `deploy` le o arquivo.
+- `openssl rand -hex 24`: senhas so com letras e numeros; caracteres como `@`
+  ou `/` quebrariam a URL de conexao do Prisma.
+- O `.env` fica so na VPS e nunca vai para o Git. Guarde uma copia das senhas
+  (`cat .env`) num gerenciador de senhas: se o arquivo se perder, o banco
+  continua exigindo a senha antiga.
 
 ---
 
 ## Fase 4: primeiro deploy, manual
 
+Como `deploy`, em `~/bookmatch-backend`:
+
 ```bash
-cd ~/bookmatch-backend
+getent hosts api-bookmatch.galpao.tech     # deve mostrar 187.41.123.210
 bash deploy/deploy.sh
+curl -sS https://api-bookmatch.galpao.tech/health
 ```
 
 A primeira execucao demora alguns minutos (baixa as imagens base e monta a da
-API). Depois, teste do seu computador:
+API). A resposta esperada do `curl` e
+`{"status":"ok","service":"bookmatch-backend",...}`. O Swagger fica em
+`https://api-bookmatch.galpao.tech/api/docs`.
 
-```bash
-curl https://api-bookmatch.galpao.tech/health
-```
-
-A resposta esperada e `{"status":"ok","service":"bookmatch-backend",...}`. O
-Swagger fica em `https://api-bookmatch.galpao.tech/api/docs`.
-
-Se o HTTPS falhar, veja os logs do Caddy (`docker compose -f compose.prod.yaml
-logs caddy`). As causas mais comuns sao o DNS ainda nao apontar para a VPS ou
-a porta 80 estar fechada.
+Se o HTTPS falhar, veja os logs do Caddy
+(`docker compose -f compose.prod.yaml logs caddy`). As causas mais comuns sao
+o DNS ainda nao apontar para a VPS ou a porta 80 estar fechada.
 
 ---
 
 ## Fase 5: chave do GitHub Actions e deploy automatico
 
-O job "Deploy na VPS" entra na VPS por SSH como `deploy`. Ele precisa de um par
-de chaves proprio, diferente da sua chave pessoal. Gere o par na propria VPS,
-assim a chave privada nao passa por nenhum outro lugar alem do GitHub:
+O CD entra na VPS por SSH como `deploy`, com um par de chaves proprio. Gere o
+par na propria VPS, assim a chave privada vai direto para o GitHub, sem passar
+por outro lugar. Como `deploy`:
 
 ```bash
 ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/github_actions -N ""
-cat ~/.ssh/github_actions.pub >> ~/.ssh/authorized_keys   # publica: autoriza a entrada
-cat ~/.ssh/github_actions                                  # privada: copie tudo, de BEGIN a END
+cat ~/.ssh/github_actions.pub >> ~/.ssh/authorized_keys
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/authorized_keys
+ls -l ~/.ssh
+cat ~/.ssh/github_actions        # chave privada: copie o bloco inteiro, de BEGIN a END
 ```
 
-No GitHub, em `Rotiivv/bookmatch-backend` -> Settings -> Secrets and variables
--> Actions -> New repository secret, crie:
+O `-N ""` deixa a chave sem senha, porque o GitHub nao tem como digita-la. Os
+`chmod` sao obrigatorios: o SSH recusa a chave se outros usuarios puderem
+alterar esses arquivos.
+
+No GitHub, em `Rotiivv/bookmatch-backend` -> Settings -> Secrets and
+variables -> Actions -> New repository secret, crie:
 
 | Nome          | Valor                                             |
 | ------------- | ------------------------------------------------- |
@@ -239,29 +305,59 @@ No GitHub, em `Rotiivv/bookmatch-backend` -> Settings -> Secrets and variables
 | `VPS_USER`    | `deploy`                                          |
 | `VPS_SSH_KEY` | o conteudo da chave privada, de `BEGIN` ate `END` |
 
-Depois de salvar o secret, apague a chave privada da VPS. A publica, em
+Teste em Actions -> CD -> Run workflow (branch `main`, campo vazio). Depois
+que o deploy passar, apague a chave privada da VPS. A publica, em
 `authorized_keys`, continua la e e o que permite a entrada.
 
 ```bash
 rm ~/.ssh/github_actions
 ```
 
-Sem esses secrets, o job de deploy termina com um aviso e nao publica nada.
+Sem esses secrets, o CD termina com um aviso e nao publica nada.
 
 ---
 
 ## Operacao do dia a dia
 
-Todos os comandos rodam em `~/bookmatch-backend`, como `deploy`:
+### Pelo GitHub
 
-| Para                         | Comando                                                         |
-| ---------------------------- | --------------------------------------------------------------- |
-| Ver o estado dos containers  | `docker compose -f compose.prod.yaml ps`                        |
-| Acompanhar os logs da API    | `docker compose -f compose.prod.yaml logs -f api`               |
-| Reiniciar a API              | `docker compose -f compose.prod.yaml restart api`               |
-| Publicar de novo, manualmente| `bash deploy/deploy.sh`                                         |
-| Voltar para uma versao antiga| `git checkout <commit> && bash deploy/deploy.sh`                |
+| Para                          | Como                                                                 |
+| ----------------------------- | -------------------------------------------------------------------- |
+| Publicar uma mudanca          | Merge do PR na `main`. O CI roda e, se passar, o CD publica sozinho  |
+| Republicar a versao atual     | Actions -> CD -> Run workflow, campo vazio                           |
+| Voltar para uma versao antiga | Actions -> CD -> Run workflow, informando o hash de um commit da `main` |
+
+O CD so publica commits que pertencem a `main`. Ao voltar uma versao, as
+migrations ja aplicadas nao sao desfeitas: o banco continua com a estrutura
+mais nova. Depois, corrija o problema num PR normal.
+
+### Na VPS
+
+Como `deploy`, em `~/bookmatch-backend`:
+
+| Para                          | Comando                                           |
+| ----------------------------- | ------------------------------------------------- |
+| Ver o estado dos containers   | `docker compose -f compose.prod.yaml ps`          |
+| Acompanhar os logs da API     | `docker compose -f compose.prod.yaml logs -f api` |
+| Reiniciar a API               | `docker compose -f compose.prod.yaml restart api` |
+| Publicar de novo, manualmente | `bash deploy/deploy.sh`                           |
+
+Os logs de cada container ficam limitados a 3 arquivos de 10 MB (configuracao
+`x-logging` no `compose.prod.yaml`); os mais antigos sao apagados sozinhos.
 
 Os dados do banco ficam no volume `bookmatch-prod_mariadb_data` e sobrevivem a
 deploys e reinicios. Eles so sao apagados com `docker compose down -v`, que
 nao deve ser usado em producao.
+
+### Smoke test
+
+O `deploy/smoke-test.sh` roda no CI, mas tambem pode ser executado em
+qualquer maquina com Docker:
+
+```bash
+bash deploy/smoke-test.sh
+```
+
+Ele usa um projeto Compose separado (`bookmatch-smoke`) e um `.env`
+temporario, sobe banco, migrations e API, chama o `/health` e apaga tudo no
+fim. Nao toca nos containers nem no `.env` de producao.
