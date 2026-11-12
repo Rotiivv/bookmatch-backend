@@ -2,8 +2,9 @@
 # Teste de fumaca do pacote de producao.
 #
 # Executa o mesmo roteiro do deploy/deploy.sh numa copia descartavel:
-# monta as imagens, sobe o banco, aplica as migrations, sobe a API e chama o
-# /health. Nao sobe o Caddy (nao ha dominio nem certificado) e apaga tudo no fim.
+# monta as imagens (em vez de baixar do GHCR), sobe o banco, aplica as
+# migrations, sobe a API e chama o /health. Nao sobe o Caddy (nao ha dominio
+# nem certificado) e apaga tudo no fim.
 #
 # Roda no CI, antes do merge, e tambem manualmente:
 #   bash deploy/smoke-test.sh
@@ -18,7 +19,8 @@ PROJECT=bookmatch-smoke
 ENV_FILE="$(mktemp)"
 
 compose() {
-  docker compose -p "$PROJECT" --env-file "$ENV_FILE" -f compose.prod.yaml --profile tools "$@"
+  docker compose -p "$PROJECT" --env-file "$ENV_FILE" \
+    -f compose.prod.yaml -f compose.build.yaml --profile tools "$@"
 }
 
 cleanup() {
@@ -34,6 +36,7 @@ on_error() {
 trap on_error ERR
 
 cat > "$ENV_FILE" <<EOF
+IMAGE_TAG=smoke
 API_DOMAIN=localhost
 MARIADB_DATABASE=bookmatch
 MARIADB_USER=bookmatch
@@ -56,7 +59,7 @@ echo "$migrate_log"
 # A CLI do Prisma so avisa (nao falha) quando falta o OpenSSL, mas as
 # migrations podem quebrar depois. Tratamos o aviso como erro.
 if grep -q "failed to detect the libssl/openssl version" <<< "$migrate_log"; then
-  echo "==> A imagem de build esta sem OpenSSL (exigido pela CLI do Prisma)." >&2
+  echo "==> A imagem migrate esta sem OpenSSL (exigido pela CLI do Prisma)." >&2
   false
 fi
 

@@ -50,12 +50,14 @@ O workflow `.github/workflows/ci.yml` executa lint, build, testes unitários,
 testes e2e e um smoke test do pacote de produção (`deploy/smoke-test.sh`) em
 todo pull request e em todo push na `main`.
 
-Quando o CI passa na `main`, o workflow `.github/workflows/cd.yml` publica a
+Quando o CI passa na `main`, o workflow `.github/workflows/cd.yml` monta as
+imagens Docker da API, publica no GitHub Container Registry (GHCR) e coloca a
 nova versão em produção. Ele também pode ser disparado manualmente, para
 republicar ou voltar para um commit anterior da `main`.
 
 ## Deploy
 
 A API roda numa VPS com Docker Compose (`compose.prod.yaml`): Caddy (HTTPS),
-API e MariaDB. O passo a passo para preparar a VPS e ligar o deploy automático
-está em [`docs/deploy.md`](docs/deploy.md).
+API e MariaDB. A VPS não tem o código-fonte: recebe só as imagens prontas do
+GHCR e os arquivos de implantação. O passo a passo para preparar a VPS e ligar
+o deploy automático está em [`docs/deploy.md`](docs/deploy.md).

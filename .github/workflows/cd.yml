@@ -18,9 +18,14 @@ on:
 permissions:
   contents: read
 
+env:
+  IMAGEM_API: ghcr.io/rotiivv/bookmatch-backend
+  IMAGEM_MIGRATE: ghcr.io/rotiivv/bookmatch-backend-migrate
+
 jobs:
-  deploy:
-    name: Deploy na VPS
+  # 1. Monta as imagens aqui, na maquina do GitHub, e publica no GHCR.
+  imagens:
+    name: Montar e publicar as imagens
     # Automatico: so se o CI passou num push na main (nunca em PR).
     # Manual: so a partir da main.
     if: >-
@@ -29,6 +34,74 @@ jobs:
         && github.event.workflow_run.event == 'push')
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha: ${{ steps.alvo.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Historico completo, para conferir que o commit pertence a main.
+          fetch-depth: 0
+
+      - name: Definir o commit
+        id: alvo
+        env:
+          # Automatico: o commit que o CI testou.
+          # Manual: o informado no botao ou, se vazio, o ultimo da main.
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.commit }}
+          MAIN_SHA: ${{ github.sha }}
+        run: |
+          sha="${RUN_SHA:-${INPUT_SHA:-$MAIN_SHA}}"
+          if ! [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Commit invalido: '$sha'. Use o hash do commit (7 a 40 caracteres)."
+            exit 1
+          fi
+          # Hash curto -> hash completo, que e a tag das imagens.
+          if ! completo="$(git rev-parse --verify --quiet "$sha^{commit}")"; then
+            echo "::error::O commit '$sha' nao existe no repositorio."
+            exit 1
+          fi
+          sha="$completo"
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "::error::O commit $sha nao faz parte da main; deploy cancelado."
+            exit 1
+          fi
+          git checkout --quiet --detach "$sha"
+          echo "Commit a publicar: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Entrar no GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Montar e publicar
+        env:
+          SHA: ${{ steps.alvo.outputs.sha }}
+        run: |
+          # Republicar ou voltar versao: se as imagens deste commit ja existem,
+          # usa as mesmas, sem montar de novo.
+          if docker manifest inspect "$IMAGEM_API:$SHA" > /dev/null 2>&1 \
+            && docker manifest inspect "$IMAGEM_MIGRATE:$SHA" > /dev/null 2>&1; then
+            echo "Imagens de $SHA ja estao no GHCR; nada a montar."
+            exit 0
+          fi
+          docker build --target runtime -t "$IMAGEM_API:$SHA" .
+          docker build --target migrate -t "$IMAGEM_MIGRATE:$SHA" .
+          docker push "$IMAGEM_API:$SHA"
+          docker push "$IMAGEM_MIGRATE:$SHA"
+
+  # 2. Envia so os arquivos de implantacao para a VPS, que baixa as imagens.
+  deploy:
+    name: Deploy na VPS
+    needs: imagens
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     environment:
       name: producao
       url: https://api-bookmatch.galpao.tech/health
@@ -50,43 +123,39 @@ jobs:
             echo "pronto=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Definir o commit
-        id: alvo
-        env:
-          # Automatico: o commit que o CI testou.
-          # Manual: o informado no botao ou, se vazio, o ultimo da main.
-          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
-          INPUT_SHA: ${{ inputs.commit }}
-          MAIN_SHA: ${{ github.sha }}
-        run: |
-          sha="${RUN_SHA:-${INPUT_SHA:-$MAIN_SHA}}"
-          if ! [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
-            echo "::error::Commit invalido: '$sha'. Use o hash do commit (7 a 40 caracteres)."
-            exit 1
-          fi
-          echo "Commit a publicar: $sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        if: steps.config.outputs.pronto == 'true'
+        with:
+          ref: ${{ needs.imagens.outputs.sha }}
 
       - name: Publicar na VPS
         if: steps.config.outputs.pronto == 'true'
         env:
-          SHA: ${{ steps.alvo.outputs.sha }}
+          SHA: ${{ needs.imagens.outputs.sha }}
+          # Token temporario deste job (so leitura de pacotes). Expira quando
+          # o job termina e nao fica gravado na VPS.
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USUARIO_GHCR: ${{ github.actor }}
         run: |
           install -d -m 700 ~/.ssh
           printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -t ed25519 "$VPS_HOST" >> ~/.ssh/known_hosts
 
-          # Na VPS: atualiza a main, confere que o commit pertence a ela,
-          # faz o checkout e executa o roteiro de deploy.
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" "
+          vps() {
+            ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" "$@"
+          }
+
+          echo "==> Enviando os arquivos de implantacao para ~/bookmatch"
+          tar -cz compose.prod.yaml deploy/Caddyfile deploy/deploy.sh \
+            | vps 'mkdir -p ~/bookmatch && tar -xz -C ~/bookmatch'
+
+          # O token vai pela entrada padrao (nunca na linha de comando) e o
+          # logout acontece no fim, mesmo se o deploy falhar.
+          echo "==> Deploy de $SHA"
+          printf '%s' "$TOKEN" | vps "
             set -e
-            cd ~/bookmatch-backend
-            git fetch --quiet origin main
-            if ! git merge-base --is-ancestor $SHA origin/main; then
-              echo 'O commit $SHA nao faz parte da main; deploy cancelado.' >&2
-              exit 1
-            fi
-            git checkout --quiet --detach $SHA
-            bash deploy/deploy.sh
+            trap 'docker logout ghcr.io > /dev/null' EXIT
+            docker login ghcr.io -u '$USUARIO_GHCR' --password-stdin > /dev/null
+            IMAGE_TAG='$SHA' bash ~/bookmatch/deploy/deploy.sh
           "

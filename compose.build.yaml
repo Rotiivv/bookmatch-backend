@@ -1,0 +1,14 @@
+# Acrescenta ao compose.prod.yaml as instrucoes para montar as imagens a partir
+# do codigo. Usado so pelo smoke test (deploy/smoke-test.sh), no CI ou na sua
+# maquina. Na VPS este arquivo nao existe: ela baixa as imagens prontas do GHCR.
+#
+#   docker compose -f compose.prod.yaml -f compose.build.yaml build
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+  migrate:
+    build:
+      context: .
+      target: migrate
