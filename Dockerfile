@@ -1,12 +1,18 @@
-# Imagem de producao da API.
+# Imagens de producao da API.
 #
-# Dois estagios:
-# - build: instala todas as dependencias, gera o client do Prisma e compila
-#   o TypeScript. Tambem e usado pelo servico "migrate" do compose.prod.yaml,
-#   pois contem a CLI do Prisma (dependencia de desenvolvimento).
-# - runtime: apenas dependencias de producao e o codigo compilado.
+# As imagens sao montadas no GitHub Actions (workflow de CD) e publicadas no
+# GHCR. A VPS so baixa as imagens prontas: nao recebe o codigo-fonte nem compila.
+#
+# Estagios:
+# - deps:    sistema e todas as dependencias (base dos dois seguintes).
+# - build:   gera o client do Prisma e compila o TypeScript para dist/.
+# - migrate: imagem do servico "migrate": so a CLI do Prisma, o schema e as
+#            migrations. Sem o src/.
+# - runtime: imagem da API: dependencias de producao e o dist/ compilado.
 
-FROM node:24-slim AS build
+FROM node:24-slim AS deps
+# Liga as imagens publicadas no GHCR a este repositorio.
+LABEL org.opencontainers.image.source=https://github.com/Rotiivv/bookmatch-backend
 WORKDIR /app
 
 # A CLI do Prisma (usada pelo servico migrate) precisa da biblioteca OpenSSL,
@@ -18,6 +24,8 @@ RUN apt-get update \
 COPY package.json package-lock.json ./
 RUN npm ci
 
+
+FROM deps AS build
 # Apenas o que o build usa. O .dockerignore continua como segunda protecao.
 COPY tsconfig.json tsconfig.build.json nest-cli.json prisma7.config.ts ./
 COPY prisma ./prisma
@@ -29,7 +37,16 @@ RUN DATABASE_URL="mysql://build:build@localhost:3306/build" npm run prisma:gener
   && npm run build
 
 
+FROM deps AS migrate
+COPY prisma7.config.ts ./
+COPY prisma ./prisma
+USER node
+# DATABASE_URL vem do compose.prod.yaml.
+CMD ["node_modules/.bin/prisma", "migrate", "deploy"]
+
+
 FROM node:24-slim AS runtime
+LABEL org.opencontainers.image.source=https://github.com/Rotiivv/bookmatch-backend
 ENV NODE_ENV=production
 WORKDIR /app
 

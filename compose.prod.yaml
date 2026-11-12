@@ -3,13 +3,21 @@
 # Servicos:
 # - caddy:   unica porta aberta para a internet (80/443). Obtem e renova o
 #            certificado HTTPS e repassa as requisicoes para a API.
-# - api:     a aplicacao, montada a partir do Dockerfile.
+# - api:     a aplicacao, imagem pronta baixada do GHCR.
 # - mariadb: o banco, acessivel apenas pela rede interna do Compose.
 # - migrate: tarefa avulsa que aplica as migrations do Prisma. Nao fica
 #            rodando; e executada pelo deploy/deploy.sh a cada deploy.
 #
 # Os valores vem do arquivo .env ao lado deste arquivo, na VPS
 # (modelo em deploy/env.production.example).
+#
+# IMAGE_TAG e o commit publicado. Quem informa e o deploy/deploy.sh, chamado
+# pelo workflow de CD. Sem ele, comandos como "ps" e "logs" funcionam, mas um
+# "up" falha ao procurar a imagem "defina-IMAGE_TAG", em vez de publicar algo
+# por engano.
+#
+# Este arquivo nao monta imagens. No CI, o smoke test junta o
+# compose.build.yaml, que acrescenta os "build:".
 
 name: bookmatch-prod
 
@@ -41,11 +49,8 @@ services:
         condition: service_healthy
 
   api:
-    build:
-      context: .
-      target: runtime
+    image: ghcr.io/rotiivv/bookmatch-backend:${IMAGE_TAG:-defina-IMAGE_TAG}
     logging: *logging
-    image: bookmatch-backend:latest
     restart: unless-stopped
     environment:
       PORT: 3000
@@ -91,13 +96,10 @@ services:
       start_period: 10s
 
   migrate:
-    build:
-      context: .
-      target: build
-    image: bookmatch-backend-build:latest
+    # So a CLI do Prisma, o schema e as migrations (estagio migrate do Dockerfile).
+    image: ghcr.io/rotiivv/bookmatch-backend-migrate:${IMAGE_TAG:-defina-IMAGE_TAG}
     environment:
       DATABASE_URL: mysql://${MARIADB_USER}:${MARIADB_PASSWORD}@mariadb:3306/${MARIADB_DATABASE}
-    command: ["npx", "prisma", "migrate", "deploy"]
     depends_on:
       mariadb:
         condition: service_healthy

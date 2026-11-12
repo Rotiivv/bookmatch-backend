@@ -16,16 +16,34 @@ pull request
 merge na main
   -> CI roda de novo na main
   -> CD (.github/workflows/cd.yml), apenas se o CI passou:
-       entra na VPS por SSH como usuario deploy e executa
-         git fetch + confere que o commit pertence a main + git checkout
+       job "Montar e publicar as imagens", na maquina do GitHub:
+         confere que o commit pertence a main
+         monta as imagens da API e do migrate e publica no GHCR
+         (ghcr.io/rotiivv/bookmatch-backend[-migrate]:<hash do commit>)
+       job "Deploy na VPS":
+         envia compose.prod.yaml, deploy/Caddyfile e deploy/deploy.sh
+         para ~/bookmatch, entra no GHCR com um token temporario e executa
          bash deploy/deploy.sh
-           -> monta as imagens Docker na propria VPS
+           -> baixa as imagens prontas da versao
            -> sobe o MariaDB
            -> aplica as migrations do Prisma
            -> sobe a API e o Caddy e espera a API ficar saudavel
 ```
 
-O CD tambem pode ser disparado a mao (veja "Operacao do dia a dia").
+A VPS nao tem o codigo-fonte nem o Git e nao compila nada: recebe imagens
+prontas, as mesmas para todo deploy da mesma versao. O CD tambem pode ser
+disparado a mao (veja "Operacao do dia a dia").
+
+Na VPS ficam so estes arquivos:
+
+```text
+/home/deploy/bookmatch/
+|-- compose.prod.yaml     enviado pelo CD a cada deploy
+|-- .env                  criado por voce (fase 3); fica so na VPS
+`-- deploy/
+    |-- Caddyfile         enviado pelo CD
+    `-- deploy.sh         enviado pelo CD
+```
 
 Na VPS rodam tres containers, descritos em `compose.prod.yaml`:
 
@@ -46,7 +64,7 @@ Valores usados neste guia:
 | Dominio da API    | `api-bookmatch.galpao.tech`      |
 | Sistema           | Ubuntu 26.04 LTS                 |
 | Usuario de deploy | `deploy`                         |
-| Pasta do projeto  | `/home/deploy/bookmatch-backend` |
+| Pasta na VPS      | `/home/deploy/bookmatch`         |
 
 Os comandos podem ser executados pelo terminal do navegador do hPanel ou por
 SSH. Quando um passo trocar de usuario com `su - deploy`, rode o `su` sozinho
@@ -187,7 +205,7 @@ curl -fsSI "https://download.docker.com/linux/ubuntu/dists/$(. /etc/os-release &
 ```
 
 ```bash
-apt install -y ca-certificates curl git
+apt install -y ca-certificates curl
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
@@ -226,25 +244,25 @@ exit
 
 ---
 
-## Fase 3: codigo e configuracao de producao
+## Fase 3: pasta e configuracao de producao
 
-Como `deploy` (`su - deploy`, sozinho). O repositorio e publico, entao a VPS
-clona sem precisar de chave.
-
-```bash
-git clone https://github.com/Rotiivv/bookmatch-backend.git ~/bookmatch-backend
-cd ~/bookmatch-backend
-```
+Como `deploy` (`su - deploy`, sozinho). A VPS nao recebe o repositorio: so
+precisa da pasta e do `.env` (modelo em `deploy/env.production.example`). O
+restante o CD envia a cada deploy.
 
 Crie o `.env` de producao com senhas geradas automaticamente:
 
 ```bash
-cp deploy/env.production.example .env
+mkdir -p ~/bookmatch && cd ~/bookmatch
+cat > .env <<EOF
+API_DOMAIN=api-bookmatch.galpao.tech
+MARIADB_DATABASE=bookmatch
+MARIADB_USER=bookmatch
+MARIADB_PASSWORD=$(openssl rand -hex 24)
+MARIADB_ROOT_PASSWORD=$(openssl rand -hex 24)
+EOF
 chmod 600 .env
-sed -i "s/^MARIADB_PASSWORD=.*/MARIADB_PASSWORD=$(openssl rand -hex 24)/" .env
-sed -i "s/^MARIADB_ROOT_PASSWORD=.*/MARIADB_ROOT_PASSWORD=$(openssl rand -hex 24)/" .env
-git check-ignore .env && echo "ok: .env ignorado pelo git"
-grep -v '^#' .env | grep -v '^$' | sed -E 's/(PASSWORD=).*/\1********/'
+sed -E 's/(PASSWORD=).*/\1********/' .env
 ```
 
 - `chmod 600`: so o `deploy` le o arquivo.
@@ -256,28 +274,7 @@ grep -v '^#' .env | grep -v '^$' | sed -E 's/(PASSWORD=).*/\1********/'
 
 ---
 
-## Fase 4: primeiro deploy, manual
-
-Como `deploy`, em `~/bookmatch-backend`:
-
-```bash
-getent hosts api-bookmatch.galpao.tech     # deve mostrar 187.41.123.210
-bash deploy/deploy.sh
-curl -sS https://api-bookmatch.galpao.tech/health
-```
-
-A primeira execucao demora alguns minutos (baixa as imagens base e monta a da
-API). A resposta esperada do `curl` e
-`{"status":"ok","service":"bookmatch-backend",...}`. O Swagger fica em
-`https://api-bookmatch.galpao.tech/api/docs`.
-
-Se o HTTPS falhar, veja os logs do Caddy
-(`docker compose -f compose.prod.yaml logs caddy`). As causas mais comuns sao
-o DNS ainda nao apontar para a VPS ou a porta 80 estar fechada.
-
----
-
-## Fase 5: chave do GitHub Actions e deploy automatico
+## Fase 4: chave do GitHub Actions
 
 O CD entra na VPS por SSH como `deploy`, com um par de chaves proprio. Gere o
 par na propria VPS, assim a chave privada vai direto para o GitHub, sem passar
@@ -305,15 +302,44 @@ variables -> Actions -> New repository secret, crie:
 | `VPS_USER`    | `deploy`                                          |
 | `VPS_SSH_KEY` | o conteudo da chave privada, de `BEGIN` ate `END` |
 
-Teste em Actions -> CD -> Run workflow (branch `main`, campo vazio). Depois
-que o deploy passar, apague a chave privada da VPS. A publica, em
+Sem esses secrets, o CD termina com um aviso e nao publica nada.
+
+---
+
+## Fase 5: primeiro deploy
+
+Confira o DNS na VPS (`getent hosts api-bookmatch.galpao.tech` deve mostrar
+`187.41.123.210`) e dispare o CD: Actions -> CD -> Run workflow (branch
+`main`, campo vazio). Depois:
+
+```bash
+curl -sS https://api-bookmatch.galpao.tech/health
+```
+
+O primeiro deploy demora alguns minutos (a VPS baixa as imagens inteiras); os
+seguintes so baixam as camadas que mudaram. A resposta esperada do `curl` e
+`{"status":"ok","service":"bookmatch-backend",...}`. O Swagger fica em
+`https://api-bookmatch.galpao.tech/api/docs`.
+
+Se o HTTPS falhar, veja os logs do Caddy (em `~/bookmatch`:
+`docker compose -f compose.prod.yaml logs caddy`). As causas mais comuns sao
+o DNS ainda nao apontar para a VPS ou a porta 80 estar fechada.
+
+Com o deploy funcionando, apague a chave privada da VPS. A publica, em
 `authorized_keys`, continua la e e o que permite a entrada.
 
 ```bash
 rm ~/.ssh/github_actions
 ```
 
-Sem esses secrets, o CD termina com um aviso e nao publica nada.
+### Imagens no GHCR
+
+As imagens aparecem em github.com/Rotiivv -> Packages
+(`bookmatch-backend` e `bookmatch-backend-migrate`), uma versao por commit
+publicado. Pacotes privados contam no limite de armazenamento do plano do
+GitHub; como o repositorio e publico e as imagens so tem o codigo compilado,
+podem ficar publicos (Package settings -> Change visibility). O deploy
+funciona do mesmo jeito nos dois casos.
 
 ---
 
@@ -327,20 +353,30 @@ Sem esses secrets, o CD termina com um aviso e nao publica nada.
 | Republicar a versao atual     | Actions -> CD -> Run workflow, campo vazio                           |
 | Voltar para uma versao antiga | Actions -> CD -> Run workflow, informando o hash de um commit da `main` |
 
-O CD so publica commits que pertencem a `main`. Ao voltar uma versao, as
-migrations ja aplicadas nao sao desfeitas: o banco continua com a estrutura
-mais nova. Depois, corrija o problema num PR normal.
+O CD so publica commits que pertencem a `main`. Se as imagens do commit ja
+estao no GHCR, ele usa as mesmas, sem montar de novo. Commits anteriores a
+publicacao pelo GHCR nao tem imagem e sao montados na hora, o que so funciona
+se o `Dockerfile` daquele commit ja tiver o estagio `migrate`.
+
+Ao voltar uma versao, as migrations ja aplicadas nao sao desfeitas: o banco
+continua com a estrutura mais nova. Depois, corrija o problema num PR normal.
 
 ### Na VPS
 
-Como `deploy`, em `~/bookmatch-backend`:
+Como `deploy`, em `~/bookmatch`:
 
-| Para                          | Comando                                           |
-| ----------------------------- | ------------------------------------------------- |
-| Ver o estado dos containers   | `docker compose -f compose.prod.yaml ps`          |
-| Acompanhar os logs da API     | `docker compose -f compose.prod.yaml logs -f api` |
-| Reiniciar a API               | `docker compose -f compose.prod.yaml restart api` |
-| Publicar de novo, manualmente | `bash deploy/deploy.sh`                           |
+| Para                        | Comando                                           |
+| --------------------------- | ------------------------------------------------- |
+| Ver o estado dos containers | `docker compose -f compose.prod.yaml ps`          |
+| Acompanhar os logs da API   | `docker compose -f compose.prod.yaml logs -f api` |
+| Reiniciar a API             | `docker compose -f compose.prod.yaml restart api` |
+
+Para publicar, use o CD (pelo GitHub). Um `docker compose up` feito a mao, sem
+o `IMAGE_TAG` que o CD informa, falha de proposito ao procurar a imagem
+`defina-IMAGE_TAG`, em vez de publicar uma versao qualquer.
+
+A cada deploy, o `deploy.sh` apaga da VPS as imagens de outras versoes e
+mantem as da versao atual.
 
 Os logs de cada container ficam limitados a 3 arquivos de 10 MB (configuracao
 `x-logging` no `compose.prod.yaml`); os mais antigos sao apagados sozinhos.
@@ -352,7 +388,9 @@ nao deve ser usado em producao.
 ### Smoke test
 
 O `deploy/smoke-test.sh` roda no CI, mas tambem pode ser executado em
-qualquer maquina com Docker:
+qualquer maquina com Docker. Ele monta as imagens a partir do codigo
+(juntando o `compose.build.yaml` ao `compose.prod.yaml`) em vez de baixa-las
+do GHCR:
 
 ```bash
 bash deploy/smoke-test.sh
@@ -361,3 +399,30 @@ bash deploy/smoke-test.sh
 Ele usa um projeto Compose separado (`bookmatch-smoke`) e um `.env`
 temporario, sobe banco, migrations e API, chama o `/health` e apaga tudo no
 fim. Nao toca nos containers nem no `.env` de producao.
+
+---
+
+## Migracao do formato antigo (uma vez)
+
+Ate o PR #4, a VPS tinha um clone do repositorio em `~/bookmatch-backend` e
+compilava a API. Para passar ao formato atual sem perder dados:
+
+1. **Antes do merge**, como `deploy`, copie (nao mova) o `.env`:
+
+   ```bash
+   mkdir -p ~/bookmatch
+   cp ~/bookmatch-backend/.env ~/bookmatch/.env
+   chmod 600 ~/bookmatch/.env
+   ```
+
+2. Faca o merge. O CD publica a partir de `~/bookmatch`. Como o nome do
+   projeto Compose continua `bookmatch-prod`, os containers e o volume do
+   banco sao os mesmos: os dados sao preservados.
+
+3. Confira o `/health` e o `docker compose -f compose.prod.yaml ps` em
+   `~/bookmatch`.
+
+4. So entao limpe o formato antigo: a pasta `~/bookmatch-backend`, as imagens
+   montadas na VPS (`bookmatch-backend:latest` e
+   `bookmatch-backend-build:latest`), o cache de build do Docker e, se quiser,
+   o Git.
