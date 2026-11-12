@@ -1,0 +1,92 @@
+name: CD
+
+on:
+  # Automatico: quando o workflow CI termina na main.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Manual: botao "Run workflow" na aba Actions, para republicar ou voltar
+  # para um commit anterior da main.
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit da main a publicar (vazio = ultimo commit da main)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy na VPS
+    # Automatico: so se o CI passou num push na main (nunca em PR).
+    # Manual: so a partir da main.
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push')
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    environment:
+      name: producao
+      url: https://api-bookmatch.galpao.tech/health
+    concurrency:
+      group: deploy-producao
+      cancel-in-progress: false
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+    steps:
+      - name: Conferir configuracao
+        id: config
+        run: |
+          if [ -z "$VPS_HOST" ] || [ -z "$VPS_USER" ] || [ -z "$VPS_SSH_KEY" ]; then
+            echo "::warning::Secrets VPS_HOST, VPS_USER e VPS_SSH_KEY nao configurados; deploy ignorado."
+            echo "pronto=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "pronto=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Definir o commit
+        id: alvo
+        env:
+          # Automatico: o commit que o CI testou.
+          # Manual: o informado no botao ou, se vazio, o ultimo da main.
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.commit }}
+          MAIN_SHA: ${{ github.sha }}
+        run: |
+          sha="${RUN_SHA:-${INPUT_SHA:-$MAIN_SHA}}"
+          if ! [[ "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Commit invalido: '$sha'. Use o hash do commit (7 a 40 caracteres)."
+            exit 1
+          fi
+          echo "Commit a publicar: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar na VPS
+        if: steps.config.outputs.pronto == 'true'
+        env:
+          SHA: ${{ steps.alvo.outputs.sha }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -t ed25519 "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          # Na VPS: atualiza a main, confere que o commit pertence a ela,
+          # faz o checkout e executa o roteiro de deploy.
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$VPS_USER@$VPS_HOST" "
+            set -e
+            cd ~/bookmatch-backend
+            git fetch --quiet origin main
+            if ! git merge-base --is-ancestor $SHA origin/main; then
+              echo 'O commit $SHA nao faz parte da main; deploy cancelado.' >&2
+              exit 1
+            fi
+            git checkout --quiet --detach $SHA
+            bash deploy/deploy.sh
+          "
